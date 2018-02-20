@@ -43,6 +43,8 @@ urlpatterns = [
     url(r'^printall/$', urnik.views.print_all, name='printall'),
     url(r'^printall/ucilnice/(?P<oddelek>[MF])/$', urnik.views.print_all_ucilnice, name='printall_ucilnice'),
     url(r'^printall/smeri/(?P<oddelek>[MF])/$', urnik.views.print_all_smeri, name='printall_smeri'),
+
+    url(r'^api/', include('urnik.api.urls')),
 ]
 
 if 'silk' in settings.INSTALLED_APPS:
