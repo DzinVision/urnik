@@ -37,7 +37,7 @@ def letniki(request):
         'letniki': letniki,
     }
 
-    return HttpResponse(json.dumps(res))
+    return HttpResponse(json.dumps(res), content_type='application/json')
 
 
 def urnik_letnika(request):
@@ -78,4 +78,4 @@ def urnik_letnika(request):
         'srecanja': srecanja,
     }
 
-    return HttpResponse(json.dumps(res))
+    return HttpResponse(json.dumps(res), content_type='application/json')

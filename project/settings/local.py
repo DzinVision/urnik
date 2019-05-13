@@ -38,5 +38,5 @@ LOGGING = {
     },
 }
 
-with open('ldap_password.txt') as f:
-    AUTH_LDAP_BIND_PASSWORD = f.read().strip()
+# with open('ldap_password.txt') as f:
+#     AUTH_LDAP_BIND_PASSWORD = f.read().strip()
