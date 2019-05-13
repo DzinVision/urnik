@@ -1,4 +1,4 @@
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.shortcuts import redirect
 from .models import Oseba, Letnik, Ucilnica, Predmet, Srecanje, Semester, Rezervacija
 
@@ -22,6 +22,20 @@ class SemesterAdmin(admin.ModelAdmin):
     list_display_links = (
         'ime',
     )
+
+    def pripravi_kopijo(self, request, queryset):
+        if queryset.count() != 1:
+            messages.error(request, 'Izberite natanko en semester.')
+        else:
+            stari_semester = queryset.get()
+            novi_semester = stari_semester.pripravi_kopijo()
+            messages.success(request, 'Kopija {} je pripravljena. Preverite datume začetka in konca!'.format(novi_semester))
+
+
+    pripravi_kopijo.short_description = 'Pripravi kopijo semestra'
+   
+    actions = [pripravi_kopijo]
+
 
 
 @admin.register(Letnik)
@@ -129,6 +143,7 @@ class RezervacijaAdmin(admin.ModelAdmin):
         'ucilnice',
         'osebe',
     )
+    readonly_fields = ('cas_rezervacije', 'avtor_rezervacije')
 
     def seznam_oseb(self, obj):
         return ', '.join(str(oseba) for oseba in obj.osebe.all())
@@ -145,6 +160,11 @@ class RezervacijaAdmin(admin.ModelAdmin):
             'ucilnice',
             'osebe',
         )
+
+    def save_model(self, request, obj, form, change):
+        obj.avtor_rezervacije = request.user
+        super().save_model(request, obj, form, change)
+
 
 @admin.register(Srecanje)
 class SrecanjeAdmin(admin.ModelAdmin):

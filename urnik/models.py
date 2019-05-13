@@ -1,15 +1,22 @@
 import datetime
 from collections import defaultdict
 from copy import deepcopy
-from django.db import models
+
+from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import Prefetch
+from django.db import models
+from django.forms import ModelForm, CheckboxSelectMultiple, TextInput, DateInput, BooleanField, ModelMultipleChoiceField
+from django.template import defaultfilters
+
+from urnik.templatetags.tags import dan_tozilnik_mnozina
+from urnik.utils import teden_dneva
 from .layout import nastavi_sirine_srecanj, nastavi_barve
 
 MIN_URA, MAX_URA = 7, 20
 ENOTA_VISINE = 1 / (MAX_URA - MIN_URA)
 DNEVI = ('ponedeljek', 'torek', 'sreda', 'četrtek', 'petek')
 ENOTA_SIRINE = 1 / len(DNEVI)
+DAYS_IN_WEEK = 7
 
 
 class OsebaQuerySet(models.QuerySet):
@@ -25,12 +32,21 @@ class Oseba(models.Model):
     priimek = models.CharField(max_length=192)
     email = models.EmailField(blank=True)
     domaca_stran = models.CharField(max_length=192, blank=True)
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='oseba')
+
     objects = OsebaQuerySet.as_manager()
 
     class Meta:
         verbose_name_plural = 'osebe'
         default_related_name = 'osebe'
         ordering = ('priimek', 'ime')
+
+    @property
+    def priimek_ime(self):
+        if self.ime:
+            return '{} {}'.format(self.priimek, self.ime)
+        else:
+            return self.priimek
 
     def __str__(self):
         if self.ime:
@@ -177,11 +193,18 @@ class Predmet(models.Model):
         return ', '.join(letnik.kratica for letnik in self.letniki.all())
 
 
+class SemesterQuerySet(models.QuerySet):
+    def v_obdobju(self, od, do):
+        return self.filter(do__gte=od, od__lte=do)
+
+
 class Semester(models.Model):
     ime = models.CharField(max_length=192)
     od = models.DateField()
     do = models.DateField()
     objavljen = models.BooleanField(default=False)
+
+    objects = SemesterQuerySet.as_manager()
 
     class Meta:
         verbose_name_plural = 'semestri'
@@ -189,6 +212,29 @@ class Semester(models.Model):
 
     def __str__(self):
         return self.ime
+    
+    def pripravi_kopijo(self):
+        novi_semester = Semester.objects.create(
+            ime=self.ime + ' (kopija)',
+            od=self.od + datetime.timedelta(days=365),
+            do=self.do + datetime.timedelta(days=365),
+            objavljen=False
+        )
+        for srecanje in self.srecanja.all():
+            srecanje.podvoji(novi_semester=novi_semester)
+        return novi_semester
+
+    def prihodnji_tedni(self):
+        razlika = datetime.timedelta(weeks=1)
+        tedni = set()
+        danes = datetime.date.today()
+        dan = danes
+        while dan < self.do:
+            tedni.add(teden_dneva(dan))
+            dan += razlika
+        if self.do >= danes:
+            tedni.add(teden_dneva(self.do))
+        return tedni
 
 
 class SrecanjeQuerySet(models.QuerySet):
@@ -311,77 +357,14 @@ class TerminUrejanje(Termin):
             self.zasedenost = 'deloma_proste_alternative'
 
 
-class ProsteUcilniceTermin(Termin):
-    HUE_PRAZEN = 120  # zelena
-    HUE_POLN = 0  # rdeca
-
-    def __init__(self, dan, ura, ustrezne_ucilnice, zasedene_ucilnice, rezervirane_ucilnice):
-        super().__init__(dan, ura)
-        zasedene_pks = {u.pk for u in zasedene_ucilnice}
-        rezervirane_pks = {u.pk for u in rezervirane_ucilnice}
-        # Vse ustrezne proste ucilnice.
-        self.proste = [u for u in ustrezne_ucilnice if u.pk not in zasedene_pks and u.pk not in rezervirane_pks]
-        # Vse ustrezne ucilnice, ki so pa zasedene, ker je tam stalno srečanje. Vrednosti so razlogi za zasedenost.
-        self.zasedene = [(u, r) for u, r in zasedene_ucilnice.items() if u.pk not in rezervirane_pks]
-        # Vse ustrezne ucilnice, ki so pa zasedene, ker so rezervirane. Vrednosti so razlogi za zasedenost.
-        self.rezervirane = list(rezervirane_ucilnice.items())
-        # ucilnice, ki bodo prikazane, skupaj s stanjem in razlogom
-        self.prikazane_ucilnice = []
-
-    def filtriraj_ucilnice(self, pokazi_zasedene):
-        vse = [('prosta', u, None) for u in self.proste]
-        if pokazi_zasedene:
-            vse.extend([('rezervirana', u, r) for u, r in self.rezervirane])
-            vse.extend([('zasedena', u, r) for u, r in self.zasedene])
-        self.prikazane_ucilnice = sorted(vse, key=lambda x: x[1])
-
-    def hue(self):
-        h = self.HUE_PRAZEN if self.proste else self.HUE_POLN
-        return "{:.0f}".format(h)
-
-
-class ProsteUcilnice(object):
-    def __init__(self, ustrezne_ucilnice, tip, velikost):
-        self.ustrezne = ustrezne_ucilnice.filter(tip__in=tip).ustrezne_velikosti(velikost)
-        self.zasedenost_ucilnic = defaultdict(dict)
-        self.rezerviranost_ucilnic = defaultdict(dict)
-
-    def dodaj_srecanja_semestra(self, semester):
-        for srecanje in semester.srecanja.select_related('ucilnica', 'predmet').prefetch_related('ucitelji'
-                                       ).filter(ucilnica__in=self.ustrezne).exclude(ura__isnull=True):
-            for i in range(srecanje.trajanje):
-                self.zasedenost_ucilnic[srecanje.dan, srecanje.ura + i][srecanje.ucilnica] = srecanje
-
-    def upostevaj_rezervacije(self, teden):
-        for rezervacija in Rezervacija.objects.filter(
-            dan__gte=teden,
-            dan__lte=teden+datetime.timedelta(days=6)
-        ).prefetch_related(
-            Prefetch(
-                'ucilnice',
-                queryset=Ucilnica.objects.filter(pk__in=self.ustrezne)
-            ),
-            'osebe'
-        ):
-            for ucilnica in rezervacija.ucilnice.all():
-                for i in range(rezervacija.od, rezervacija.do):
-                    self.rezerviranost_ucilnic[rezervacija.dan.isoweekday(), i][ucilnica] = rezervacija
-
-    def dobi_termine(self):
-        termini = [ProsteUcilniceTermin(d, u, self.ustrezne, self.zasedenost_ucilnic[d, u],
-                                        self.rezerviranost_ucilnic[d, u])
-                   for d in range(1, len(DNEVI) + 1) for u in range(MIN_URA, MAX_URA)]
-        return termini
-
-
 class Srecanje(models.Model):
     PREDAVANJA, SEMINAR, VAJE, LABORATORIJSKE_VAJE = 'P', 'S', 'V', 'L'
     TIP = (
         (PREDAVANJA, 'predavanja'), (SEMINAR, 'seminar'),
         (VAJE, 'vaje'), (LABORATORIJSKE_VAJE, 'laboratorijske vaje'),
     )
-    semester = models.ForeignKey('urnik.Semester')
-    predmet = models.ForeignKey('urnik.Predmet', null=True, blank=True, on_delete=models.CASCADE)
+    semester = models.ForeignKey('urnik.Semester', on_delete=models.PROTECT)
+    predmet = models.ForeignKey('urnik.Predmet', null=True, blank=True, on_delete=models.SET_NULL)
     tip = models.CharField(max_length=1, choices=TIP, blank=True)
     oznaka = models.CharField(max_length=64, blank=True)
     ucitelji = models.ManyToManyField('urnik.Oseba', blank=True)
@@ -418,9 +401,14 @@ class Srecanje(models.Model):
         if self.ura:
             return self.ura + self.trajanje
 
-    def podvoji(self):
+    def se_po_urah_prekriva(self, od, do):
+        return self.od < do and od < self.do
+
+    def podvoji(self, novi_semester=None):
         stari_ucitelji = list(self.ucitelji.all())
         self.id = None
+        if novi_semester is not None:
+            self.semester = novi_semester
         self.save()
         for ucitelj in stari_ucitelji:
             self.ucitelji.add(ucitelj)
@@ -444,7 +432,7 @@ class Srecanje(models.Model):
         return self.trajanje > 1
 
     def lahko_podaljsam(self):
-        return not self.ura or self.ura + self.trajanje < MAX_URA
+        return not self.ura or self.do < MAX_URA
 
     def lahko_odlozim(self):
         return self.dan and self.ura
@@ -504,40 +492,196 @@ class Srecanje(models.Model):
                 )
         return termini
 
+    def dnevi_med(self, od, do):
+        od = max(od, self.semester.od)
+        dan = od + datetime.timedelta((self.dan - (od.weekday()+1)) % DAYS_IN_WEEK)
+        assert dan.weekday() + 1 == self.dan, "Ups."
+        dan_konca = min(self.semester.do, do)
+        razlika = datetime.timedelta(weeks=1)
+        while dan <= dan_konca:
+            yield dan
+            dan += razlika
+
 
 class RezervacijaQuerySet(models.QuerySet):
+
+    def v_tednu(self, ponedeljek):
+        nedelja = ponedeljek + datetime.timedelta(days=6)
+        return self.filter(
+            dan_konca__isnull=True,
+            dan__gte=ponedeljek,
+            dan__lte=nedelja,
+        ) | self.filter(
+            dan_konca__isnull=False,
+            dan__lte=nedelja,
+        ).exclude(
+            dan_konca__lt=ponedeljek,
+        )
 
     def prihajajoce(self):
         return self.filter(dan__gte=datetime.date.today())
 
 
 class Rezervacija(models.Model):
-    ucilnice = models.ManyToManyField('urnik.Ucilnica')
-    osebe = models.ManyToManyField('urnik.Oseba')
-    dan = models.DateField()
-    od = models.PositiveSmallIntegerField()
-    do = models.PositiveSmallIntegerField()
-    opomba = models.CharField(max_length=192)
+    ucilnice = models.ManyToManyField('urnik.Ucilnica', blank=False, help_text='Izberite učilnice, ki jih želite rezervirati',
+                                      limit_choices_to={'tip__in': Ucilnica.OBJAVLJENI_TIPI}, verbose_name='Učilnice')
+    osebe = models.ManyToManyField('urnik.Oseba', verbose_name='Osebe', help_text='Osebe, ki si lastijo to rezervacijo')
+    dan = models.DateField(verbose_name='Dan začetka', blank=False, null=False, help_text='Za kateri dan želite rezervirati')
+    dan_konca = models.DateField(blank=True, null=True, verbose_name='Dan konca', help_text='Dan konca rezervacije; izpolnite le, če je drugačen od začetka')
+    MOZNE_URE = tuple((u, str(u)+":00") for u in range(MIN_URA, MAX_URA+1))
+    od = models.PositiveSmallIntegerField(blank=False, null=False, choices=MOZNE_URE, help_text='Od katere ure želite rezervirati')
+    do = models.PositiveSmallIntegerField(blank=False, null=False, choices=MOZNE_URE, help_text='Do katere ure želite rezervirati')
+    opomba = models.CharField(max_length=192, blank=False, null=False, help_text='Razlog za rezervacijo')
+    potrjena = models.BooleanField(default=False, null=False, help_text='Ali so to rezervacijo potrdili posvečeni ljudje')
+    avtor_rezervacije = models.ForeignKey(settings.AUTH_USER_MODEL, null=False, help_text='Kdo je dejansko naredil rezervacijo', on_delete=models.CASCADE)
+    cas_rezervacije = models.DateTimeField(auto_now_add=True, help_text="Datum in čas, ko je bila rezervacija narejena", verbose_name='Datum in čas rezervacije')
+
     objects = RezervacijaQuerySet.as_manager()
+
+    @property
+    def zacetek(self):
+        return self.dan
+
+    @property
+    def konec(self):
+        return self.dan_konca or self.dan
+
+    def __str__(self):
+        if self.dan_konca:
+            return "Rezervacija od {} do {}, {}–{} za {}".format(self.zacetek, self.konec, self.od, self.do, self.opomba)
+        else:
+            return "Rezervacija dne {}, {}–{} za {}".format(self.zacetek, self.od, self.do, self.opomba)
 
     class Meta:
         verbose_name_plural = 'rezervacije'
         default_related_name = 'rezervacije'
         ordering = ('dan', 'od', 'do')
 
-    def teden(self):
-        start = self.dan - datetime.timedelta(days=self.dan.weekday())
-        end = start + datetime.timedelta(days=6)
-        return (start, end)
+    def dnevi(self):
+        dan = self.dan
+        dan_konca = self.konec
+        razlika = datetime.timedelta(days=1)
+        while dan <= dan_konca:
+            yield dan
+            dan += razlika
 
-    def konflikti(self):
-        for ucilnica in self.ucilnice.all():
-            for srecanje in ucilnica.srecanja.all():
-                if self.dan.weekday() + 1 != srecanje.dan or not srecanje.od:
-                    continue
-                elif srecanje.do <= self.od:
-                    continue
-                elif self.do <= srecanje.od:
-                    continue
-                else:
-                    yield srecanje
+    def dnevi_med(self, od, do):
+        dan = max(self.zacetek, od)
+        dan_konca = min(self.konec, do)
+        razlika = datetime.timedelta(days=1)
+        while dan <= dan_konca:
+            yield dan
+            dan += razlika
+
+    def se_po_urah_prekriva(self, od, do):
+        return self.od < do and od < self.do
+
+
+class RezervacijeModelMultipleChoiceField(ModelMultipleChoiceField):
+    def label_from_instance(self, obj):
+        return obj.priimek_ime
+
+
+class RezevacijeForm(ModelForm):
+
+    PREKRIVANJA = 'prekrivanja'
+
+    osebe = RezervacijeModelMultipleChoiceField(queryset=Oseba.objects.all())
+    use_required_attribute = False
+
+    class Meta:
+        model = Rezervacija
+        fields = ['ucilnice', 'osebe', 'dan', 'dan_konca', 'od', 'do', 'opomba']
+        widgets = {
+            'ucilnice': CheckboxSelectMultiple(),
+            'dan': DateInput(attrs={'placeholder': 'npr. 15. 1. 2019', 'class': 'datepicker'}),
+            'dan_konca': DateInput(attrs={'placeholder': 'ponavadi prazno, lahko tudi npr. 17. 1. 2019', 'class': 'datepicker'}),
+            'opomba': TextInput(attrs={'placeholder': 'npr. izpit Analiza 1 FIN'}),
+        }
+
+    def __init__(self, *args, **kwargs):
+        dovoli_prekrivanja = kwargs.pop('dovoli_prekrivanja', None)
+        super(RezevacijeForm, self).__init__(*args, **kwargs)
+        if dovoli_prekrivanja:
+            self.fields['ignoriraj_prekrivanja'] = BooleanField(
+                required=False, initial=False,
+                help_text='Zavedam se prekrivanj in vseeno želim rezervirati izbrane učilnice '
+                          'v izbranih dnevih in urah.')
+
+    def clean_dan(self):
+        dan = self.cleaned_data['dan']
+        if dan < datetime.date.today():
+            raise ValidationError("Datum rezervacije mora biti v prihodnosti.")
+        return dan
+
+    def clean(self):
+        cleaned = super().clean()
+        if self.errors:
+            return cleaned
+
+        od = cleaned.get('od')
+        do = cleaned.get('do')
+        if od >= do:
+            self.add_error(None, ValidationError("Ura začetka rezervacije mora biti pred uro konca rezervacije."))
+
+        dan = cleaned.get('dan')
+        konec = cleaned.get('dan_konca')
+        if konec:
+            if dan == konec:
+                self.cleaned_data['dan_konca'] = None
+            elif dan > konec:
+                self.add_error(None, ValidationError("Dan začetka rezervacije moda biti "
+                                                     "pred dnevom konca rezervacije."))
+        ignoriraj = cleaned.get('ignoriraj_prekrivanja')
+        if not ignoriraj:
+            self._preveri_konflikte(cleaned)
+
+        return self.cleaned_data
+
+    def _preveri_konflikte(self, cleaned):
+        from urnik.iskanik_konfliktov import IskalnikKonfliktov
+        ucilnice = cleaned.get('ucilnice')
+        dan = cleaned.get('dan')
+        konec = cleaned.get('dan_konca') or dan
+        od = cleaned.get('od')
+        do = cleaned.get('do')
+        iskalnik = IskalnikKonfliktov(ucilnice, dan, konec)
+        iskalnik.dodaj_srecanja()
+        iskalnik.dodaj_rezervacije(Rezervacija.objects.prihajajoce())
+
+        date_format = lambda d: defaultfilters.date(d, "D, j. b")
+        for u in ucilnice:
+            d = dan
+            while d <= konec:
+                konflikti = iskalnik.konflikti(u, d, od, do)
+                for r in konflikti.rezervacije:
+                    oseba = r.osebe.all()[:1]
+                    self.add_error(None, ValidationError(
+                        'Vaša rezervacija bi se prekrivala z rezervacijo osebe %(oseba)s %(dan)s '
+                        'od %(od)i do %(do)i z razlogom %(razlog)s.',
+                        params={
+                            'oseba': oseba[0] if oseba else 'neznan',
+                            'dan': "od {} do {}".format(date_format(r.dan), date_format(r.dan_konca))
+                            if r.dan_konca else "dne {}".format(date_format(r.dan)),
+                            'razlog': r.opomba,
+                            'od': r.od,
+                            'do': r.do,
+                        },
+                        code=RezevacijeForm.PREKRIVANJA,
+                    ))
+
+                for s in konflikti.srecanja:
+                    self.add_error(None, ValidationError(
+                        'Vaša rezervacija bi se prekrivala s predmetom %(predmet)s (%(semester)s), ki se izvaja '
+                        'ob %(dan_v_tednu)s od %(od)i do %(do)i.',
+                        params={
+                            'predmet': s.predmet,
+                            'semester': s.semester,
+                            'dan_v_tednu': dan_tozilnik_mnozina(s.dan),
+                            'od': s.od,
+                            'do': s.do,
+                        },
+                        code=RezevacijeForm.PREKRIVANJA,
+                    ))
+
+                d += datetime.timedelta(days=1)

@@ -12,6 +12,9 @@ https://docs.djangoproject.com/en/1.10/ref/settings/
 
 import os
 
+import ldap
+from django_auth_ldap.config import LDAPSearch
+
 # Build paths inside the project like this: os.path.join(BASE_DIR, ...)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,6 +27,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEBUG = True
 
 ALLOWED_HOSTS = []
+APPEND_SLASH = True
 
 
 # Application definition
@@ -36,6 +40,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'urnik',
+    'django.forms',
 ]
 
 MIDDLEWARE = [
@@ -101,9 +106,14 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 
 # USE_L10N = True
-DATE_FORMAT = 'd. F Y'
+DATE_FORMAT = 'D, d. F Y'
 SHORT_DATE_FORMAT = 'j. M. Y'
 FIRST_DAY_OF_WEEK = 1
+DATE_INPUT_FORMATS = [
+    '%d.%m.%Y', '%d.%m.%y',         # '25.10.2006', '25.10.06'
+    '%d-%m-%Y',                     # '25-10-2006'
+    '%d. %m. %Y', '%d. %m. %y',     # '25. 10. 2006', '25. 10. 06'
+]
 
 USE_TZ = True
 
@@ -112,3 +122,24 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/1.10/howto/static-files/
 
 STATIC_URL = '/static/'
+
+FORM_RENDERER = 'django.forms.renderers.TemplatesSetting'
+
+LOGIN_URL = '/login/'
+LOGIN_REDIRECT_URL = '/'
+LOGOUT_REDIRECT_URL = '/'
+
+AUTHENTICATION_BACKENDS = (
+    'django_auth_ldap.backend.LDAPBackend',
+    'django.contrib.auth.backends.ModelBackend',
+)
+
+AUTH_LDAP_SERVER_URI = 'ldap://dcv1fmf.fmf.uni-lj.si:3268,ldap://dcv2fmf.fmf.uni-lj.si:3268'
+AUTH_LDAP_BIND_DN = 'ldap.pretnar@fmf.uni-lj.si'
+
+AUTH_LDAP_USER_SEARCH = LDAPSearch('dc=uni-lj,dc=si', ldap.SCOPE_SUBTREE, '(mail=%(user)s)')
+AUTH_LDAP_USER_ATTR_MAP = {
+    'first_name': 'givenName',
+    'last_name': 'sn',
+    'email': 'mail'
+}
